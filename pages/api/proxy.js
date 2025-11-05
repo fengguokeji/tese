@@ -7,6 +7,9 @@ export const config = {
 };
 
 export default async function handler(req, res) {
+  const host = req.headers.host || "";
+  const isDxfg = host.startsWith("dxfg."); // 判断是否是 dxfg 域名前缀
+
   const { url, ...restQuery } = req.query;
 
   if (!url) {
@@ -50,7 +53,7 @@ export default async function handler(req, res) {
       method: req.method,
       headers,
       body,
-      redirect: "manual", // 保留 301/302 手动处理
+      redirect: "manual",
     });
 
     // ===== 处理 301/302 跳转 =====
@@ -69,11 +72,12 @@ export default async function handler(req, res) {
     const contentType = response.headers.get("content-type") || "";
     const baseUrl = new URL(targetUrl);
 
-    // ===== 处理 Cache-Control 头部 =====
-    const cacheControl = response.headers.get('Cache-Control');
-    if (cacheControl) {
-      res.setHeader('Cache-Control', cacheControl); // 直接将源站的 Cache-Control 头返回
-    }
+    // ===== 保留源站 Cache-Control 头 =====
+    const cacheControl = response.headers.get("Cache-Control");
+    if (cacheControl) res.setHeader("Cache-Control", cacheControl);
+
+    // ===== 支持所有 HTTP 方法 =====
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE");
 
     // ===== 处理 HTML =====
     if (contentType.includes("text/html")) {
@@ -90,10 +94,26 @@ export default async function handler(req, res) {
         html = `<head><base href="${proxyBaseTag}"></head>\n` + html;
       }
 
-      // 替换静态 href / src
+      // ===== 限制 dxfg 域名：仅首页加速，不加速内部链接 =====
+      const onlyHomeAccelerate = /dxfg/i.test(baseUrl.hostname);
+
+      // 替换 href / src
       html = html.replace(
         /(href|src)=["']([^"']+)["']/gi,
         (match, attr, link) => {
+          if (onlyHomeAccelerate) {
+            // 如果是 dxfg 域名，仅首页加速：跳过内部链接
+            if (!/^(https?:)?\/\//i.test(link)) {
+              return match; // 相对路径不替换
+            }
+            const linkUrl = new URL(link, baseUrl);
+            if (linkUrl.hostname === baseUrl.hostname) {
+              // 内部链接不加速
+              return `${attr}="${linkUrl.href}"`;
+            }
+          }
+
+          // 其他域名或正常逻辑
           if (/^(https?:)?\/\//i.test(link)) {
             if (link.startsWith("//")) link = baseUrl.protocol + link;
             return `${attr}="${proxyBase}${encodeURIComponent(link)}"`;
@@ -107,7 +127,7 @@ export default async function handler(req, res) {
         }
       );
 
-      // 替换静态 form action
+      // 替换 form action
       html = html.replace(
         /<form([^>]*?)action=["']([^"']+)["']([^>]*)>/gi,
         (match, before, action, after) => {
@@ -124,15 +144,20 @@ export default async function handler(req, res) {
         }
       );
 
-      // ===== 注入全局 JS Hook 动态 URL =====
+      // ===== 注入 Hook 脚本（动态跳转检测） =====
       const hookScript = `
       <script>
         (function(){
           const proxyBase = '${proxyBase}';
+          const onlyHomeAccelerate = ${/dxfg/i.test(baseUrl.hostname)};
           function proxifyUrl(url) {
             try {
               if (!url || url.startsWith('javascript:') || url.startsWith('#')) return url;
               const u = new URL(url, location.href);
+              if (onlyHomeAccelerate && u.hostname === '${baseUrl.hostname}') {
+                // dxfg 域名内部跳转，直接返回原始链接（不加速）
+                return u.href;
+              }
               return proxyBase + encodeURIComponent(u.href);
             } catch(e) { return url; }
           }
@@ -152,7 +177,7 @@ export default async function handler(req, res) {
           const _replace = history.replaceState;
           history.replaceState = function(s, t, url){ return _replace.call(this, s, t, proxifyUrl(url)); };
 
-          // 替换 a 标签 href / form action
+          // 修改所有 a 标签和 form action
           document.addEventListener('DOMContentLoaded', ()=>{
             document.querySelectorAll('a[href]').forEach(a=>{
               a.href = proxifyUrl(a.href);
@@ -161,20 +186,6 @@ export default async function handler(req, res) {
               f.action = proxifyUrl(f.action);
             });
           });
-
-          // Hook fetch
-          const _fetch = window.fetch;
-          window.fetch = function(input, init){
-            if(typeof input === 'string') input = proxifyUrl(input);
-            else if(input instanceof Request) input = new Request(proxifyUrl(input.url), input);
-            return _fetch.call(this, input, init);
-          };
-
-          // Hook XMLHttpRequest open
-          const _open = XMLHttpRequest.prototype.open;
-          XMLHttpRequest.prototype.open = function(method, url, ...rest){
-            return _open.call(this, method, proxifyUrl(url), ...rest);
-          };
         })();
       </script>
       `;
@@ -184,7 +195,7 @@ export default async function handler(req, res) {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(html);
 
-      // ===== 处理 CSS =====
+      // ===== CSS =====
     } else if (contentType.includes("text/css")) {
       let css = await response.text();
       css = css.replace(/url\(([^)]+)\)/gi, (match, rawUrl) => {
@@ -203,37 +214,16 @@ export default async function handler(req, res) {
       res.setHeader("Content-Type", "text/css; charset=utf-8");
       res.send(css);
 
-      // ===== 处理 JS =====
+      // ===== JS =====
     } else if (
       contentType.includes("application/javascript") ||
       contentType.includes("text/javascript")
     ) {
       let js = await response.text();
-      js = js.replace(
-        /fetch\((['"])(.+?)\1\)/gi,
-        (match, quote, link) => {
-          return `fetch(${quote}${proxyBase}${encodeURIComponent(
-            new URL(link, baseUrl).href
-          )}${quote})`;
-        }
-      );
-      js = js.replace(
-        /open\((['"])(GET|POST|PUT|DELETE|HEAD|OPTIONS)\1\s*,\s*(['"])(.+?)\3/gi,
-        (match, q1, method, q2, link) => {
-          return `open(${q1}${method}${q1}, ${q2}${proxyBase}${encodeURIComponent(
-            new URL(link, baseUrl).href
-          )}${q2}`;
-        }
-      );
-      js = js.replace(/url:\s*(['"])(.+?)\1/gi, (match, quote, link) => {
-        return `url: ${quote}${proxyBase}${encodeURIComponent(
-          new URL(link, baseUrl).href
-        )}${quote}`;
-      });
       res.setHeader("Content-Type", "application/javascript; charset=utf-8");
       res.send(js);
 
-      // ===== 其他文件直接透传 =====
+      // ===== 其他类型 =====
     } else {
       res.status(response.status);
       response.headers.forEach((value, key) => {
